@@ -1,111 +1,130 @@
+import json, time, sys
 from dotenv import load_dotenv
-from typing import Annotated
-from typing_extensions import TypedDict
-from langgraph.graph.message import add_messages
-from langchain.chat_models import init_chat_model
+from typing import Annotated, TypedDict
+from langgraph.graph import StateGraph, START, END, add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
-from langchain_core.tools import tool
-from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.mongodb import MongoDBSaver
-import json
 from langgraph.types import interrupt, Command
+from langchain_openai import ChatOpenAI
+from langchain_core.tools import tool
+from langchain_core.messages import ToolMessage, HumanMessage
 
 load_dotenv()
+DB_URI = "mongodb://admin:admin@mongodb:27017"
 
+
+# --- 1. Logic & Tools ---
 @tool
-def human_assistance(query: str) -> str:
-    """Request assistance from a human."""
-    human_respomse = interrupt({"query": query})  # This saves the state in DB and kill the graph
-    return human_respomse["data"]
+def human_help(query: str) -> str:
+    """Signals human assistance is needed."""
+    return json.dumps({"need_human": True, "query": query})
 
 
-tools = [human_assistance]
+tools = [human_help]
+llm = ChatOpenAI(model="gpt-4o").bind_tools(tools)
 
 
-class State(TypedDict):
-    messages: Annotated[list, add_messages]
+def chatbot(state):
+    return {"messages": [llm.invoke([{
+        "role": "system",
+        "content": "If user needs help, call human_help tool."
+    }] + state["messages"])]}
 
 
-llm = init_chat_model(model_provider="openai", model="gpt-4.1")
-llm_with_tools = llm.bind_tools(tools=tools)
+def human_node(state):
+    last = state["messages"][-1]
+    if isinstance(last, ToolMessage) and json.loads(last.content).get("need_human"):
+        query = json.loads(last.content)["query"]
+        print(f"\n[SYSTEM] Paused for Admin. Query: {query}")
+
+        # Pause here. Resume with admin input.
+        solution = interrupt({"query": query})
+
+        return {"messages": [HumanMessage(f"SYSTEM: Admin resolved this: {solution}")]}
+    return {"messages": []}
 
 
-def chatbot(state: State):
-    message = llm_with_tools.invoke(state["messages"])
-    return {"messages": [message]}
+# --- 2. Graph Definition ---
+def get_app(checkpointer):
+    workflow = StateGraph(TypedDict("State", {"messages": Annotated[list, add_messages]}))
+    workflow.add_node("bot", chatbot)
+    workflow.add_node("tools", ToolNode(tools))
+    workflow.add_node("human", human_node)
+
+    workflow.add_edge(START, "bot")
+    workflow.add_conditional_edges("bot", tools_condition, {"tools": "tools", "__end__": END})
+    workflow.add_edge("tools", "human")
+    workflow.add_edge("human", "bot")
+    return workflow.compile(checkpointer=checkpointer)
 
 
-tool_node = ToolNode(tools=tools)
+# --- 3. Execution ---
+def run_chat(thread_id="t1"):
+    with MongoDBSaver.from_conn_string(DB_URI) as cp:
+        app = get_app(cp)
+        config = {"configurable": {"thread_id": thread_id}}
 
-graph_builder = StateGraph(State)
+        print(f"--- Chat {thread_id} ---")
 
-graph_builder.add_node("chatbot", chatbot)
-graph_builder.add_node("tools", tool_node)
-
-graph_builder.add_edge(START, "chatbot")
-graph_builder.add_conditional_edges(
-    "chatbot",
-    tools_condition,
-)
-
-graph_builder.add_edge("tools", "chatbot")
-graph_builder.add_edge("chatbot", END)
-
-
-def create_chat_graph(checkpointer):
-    return graph_builder.compile(checkpointer=checkpointer)
-
-
-def user_chat():
-    DB_URI = "mongodb://admin:admin@mongodb:27017"
-    config = {"configurable": {"thread_id": "22"}}
-
-    with MongoDBSaver.from_conn_string(DB_URI) as mongo_checkpointer:
-        graph_with_cp = create_chat_graph(mongo_checkpointer)
+        # Initialize message count
+        last_msg_count = len(app.get_state(config).values.get("messages", []))
 
         while True:
-            user_input = input("User: ")
+            # 1. Fetch latest state
+            state = app.get_state(config)
+            msgs = state.values.get("messages", [])
 
-            state = State(
-                messages=[{"role": "user", "content": user_input}]
-            )
+            # 2. Print ANY new messages (AI or System/Human)
+            if len(msgs) > last_msg_count:
+                for msg in msgs[last_msg_count:]:
+                    if isinstance(msg, HumanMessage) and msg.name != "user":
+                        # This captures the "System" message from the Admin
+                        print(f"\nSYSTEM: {msg.content}")
+                    elif hasattr(msg, "content") and msg.content and msg.type == "ai":
+                        print(f"\nAI: {msg.content}")
+                last_msg_count = len(msgs)
 
-            for event in graph_with_cp.stream(state, config, stream_mode="values"):
-                if "messages" in event:
-                    event["messages"][-1].pretty_print()
+            # 3. Check for Interrupts (Pause)
+            if state.tasks and state.tasks[0].interrupts:
+                print("Waiting for admin...", end="\r")
+                time.sleep(2)
+                continue  # Restart loop to keep checking for updates
 
+            # 4. User Input
+            try:
+                txt = input("\nUser: ")
+                if txt.lower() in ["q", "exit"]:
+                    break
 
-def admin_call():
-    DB_URI = "mongodb://admin:admin@mongodb:27017"
-    config = {"configurable": {"thread_id": "22"}}
-
-    with MongoDBSaver.from_conn_string(DB_URI) as mongo_checkpointer:
-        graph_with_cp = create_chat_graph(mongo_checkpointer)
-
-        state = graph_with_cp.get_state(config=config)
-        last_message = state.values['messages'][-1]
-
-        tool_calls = last_message.additional_kwargs.get("tool_calls", [])
-
-        user_query = None
-
-        for call in tool_calls:
-            if call.get("function", {}).get("name") == "human_assistance":
-                args = call["function"].get("arguments", "{}")
-                try:
-                    args_dict = json.loads(args)
-                    user_query = args_dict.get("query")
-                except json.JSONDecodeError:
-                    print("Failed to decode function arguments.")
-
-        print("User has a query", user_query)
-        solution = input("> ")
-
-        resume_command = Command(resume={"data": solution})
-
-        for event in graph_with_cp.stream(resume_command, config, stream_mode="values"):
-            if "messages" in event:
-                event["messages"][-1].pretty_print()
+                # Send input and run graph
+                app.invoke({"messages": [("user", txt)]}, config)
+            except KeyboardInterrupt:
+                break
 
 
-user_chat()
+def run_admin(thread_id="t1"):
+    with MongoDBSaver.from_conn_string(DB_URI) as cp:
+        app = get_app(cp)
+        config = {"configurable": {"thread_id": thread_id}}
+        state = app.get_state(config)
+
+        if state.tasks and state.tasks[0].interrupts:
+            query = state.tasks[0].interrupts[0].value["query"]
+            print(f"User asks: {query}")
+            ans = input("Admin Answer: ")
+
+            # Resume graph
+            for event in app.stream(Command(resume=ans), config, stream_mode="values"):
+                msg = event["messages"][-1]
+                if msg.type == "ai" and msg.content:
+                    print(f"AI (Resumed): {msg.content}")
+        else:
+            print("No pending tasks.")
+
+
+if __name__ == "__main__":
+    mode = sys.argv[1] if len(sys.argv) > 1 else "chat"
+    if mode == "admin":
+        run_admin()
+    else:
+        run_chat()
